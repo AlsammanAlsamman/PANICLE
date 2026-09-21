@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **LOCO MLM LRT refinement no longer stalls on traits with two-bracket markers.** Markers whose profile-ML derivative changes sign on both sides of the null h2 (caused by the clamped near-zero kinship eigenvalue making the derivative negative at h2 = 0.999, combined with an alternative-model h2 below the null h2) were sent to the ~2-3 ms/marker scalar exact solver. Both brackets are now root-solved inside the compiled LRT kernel (`_lrt_grid_solve_numba`) and the best state is kept. P-values are unchanged (< 1e-10 in -log10 p across 242k refined markers); refinement is 17-44x faster for affected traits (e.g. 47 s -> 1 s for 21,880 candidates). The numba-less NumPy path is unchanged.
 - Close VCF readers and discard temporary genotype matrices after decoding
   failures, including errors in the final bulk batch.
 - Significant-only output now handles NumPy-backed map columns correctly during
