@@ -321,3 +321,76 @@ def test_lrt_gemma_paths_suppress_matmul_runtime_warnings() -> None:
     assert 0.0 <= p_value <= 1.0
     assert np.isfinite(beta)
     assert np.isfinite(se)
+
+
+def test_fit_markers_lrt_batch_two_bracket_markers_stay_in_kernel(monkeypatch) -> None:
+    """Markers whose profile-ML derivative changes sign on both sides of the
+    null h2 (pattern -,+,- at h2_min / null h2 / h2_max) must be resolved inside
+    the compiled kernel and agree with the scalar exact solver.
+
+    A centered kinship has one ~zero eigenvalue along the intercept direction;
+    its log-det term makes the derivative negative at h2_max, so every marker
+    whose alternative h2 falls below the null h2 shows two brackets."""
+    import panicle.association.lrt as lrt_mod
+
+    if not lrt_mod.HAS_NUMBA:
+        return
+    rng = np.random.default_rng(7)
+    n, m = 200, 64
+    Z = rng.normal(size=(n, 400))
+    Z -= Z.mean(axis=0)
+    K = Z @ Z.T / 400
+    evals, U = np.linalg.eigh(K)
+    evals = np.maximum(evals, 1e-6)
+    G_raw = rng.integers(0, 3, size=(n, m)).astype(np.float64)
+    u = rng.multivariate_normal(np.zeros(n), K + 1e-8 * np.eye(n))
+    y_raw = 1.0 + 0.8 * u + G_raw[:, :8] @ np.full(8, 0.5) + rng.normal(scale=0.7, size=n)
+    y = U.T @ y_raw
+    X = U.T @ np.ones((n, 1))
+    G = U.T @ G_raw
+
+    grid = np.linspace(0.01, 0.99, 99)
+    nll = [_calculate_neg_ml_likelihood(h, y, X, evals) for h in grid]
+    null_h2 = float(grid[int(np.argmin(nll))])
+    null_neg = float(min(nll))
+
+    X_alt = np.empty((n, 2))
+    X_alt[:, :-1] = X
+    ref = []
+    for j in range(m):
+        X_alt[:, -1] = G[:, j]
+        ref.append(fit_marker_lrt_prebuilt(
+            y, X_alt, evals, null_neg, null_h2=null_h2,
+            solver_norm="GEMMA", assume_sanitized=True)[1:])
+    ref = np.asarray(ref)
+
+    # Confirm the scenario really contains two-bracket markers.
+    lam_min = lrt_mod._H2_MIN / (1 - lrt_mod._H2_MIN)
+    lam_max = lrt_mod._H2_MAX / (1 - lrt_mod._H2_MAX)
+    md = evals - 1.0
+    n_two = 0
+    for j in range(m):
+        X_alt[:, -1] = G[:, j]
+        g = [lrt_mod._lrt_eval(h, y, X_alt, evals, md, float(n), False)[1]
+             for h in (lrt_mod._H2_MIN, null_h2, lrt_mod._H2_MAX)]
+        n_two += int(g[0] < 0 < g[1] and g[2] < 0)
+    assert n_two > 0
+
+    calls = {"n": 0}
+    orig = lrt_mod._fit_marker_lrt_core
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(lrt_mod, "_fit_marker_lrt_core", counting)
+    p, b, s = fit_markers_lrt_batch_prebuilt(
+        y, X, G, evals, null_neg, null_h2=null_h2,
+        solver_norm="GEMMA", assume_sanitized=True)
+    assert calls["n"] == 0
+    logp = -np.log10(np.clip(p, 1e-300, 1.0))
+    logp_ref = -np.log10(np.clip(ref[:, 0], 1e-300, 1.0))
+    assert np.max(np.abs(logp - logp_ref)) < 1e-6
+    # Root tolerance (1e-4 relative in lambda) bounds beta/se agreement.
+    assert np.max(np.abs(b - ref[:, 1])) < 1e-4
+    assert np.max(np.abs(s - ref[:, 2])) < 1e-4

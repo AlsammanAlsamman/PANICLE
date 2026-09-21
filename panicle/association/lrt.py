@@ -1488,7 +1488,9 @@ if HAS_NUMBA:
           2. classify the marker's sign-change bracket using the exact same
              order (init-split left then right, else a left-to-right region
              scan taking the first bracket);
-          3. root-solve a single bracket and keep the better of root vs. grid.
+          3. root-solve the bracket (or both null-centered brackets when the
+             derivative changes sign on each side of the null h2) and keep the
+             best of roots vs. grid.
         Returns per-marker status (0 = resolved, 1 = send to exact fallback) and
         the best-state arrays needed to emit p-value / beta / se."""
         k = G.shape[1]
@@ -1557,6 +1559,10 @@ if HAS_NUMBA:
             sel_lh = 0.0
             sel_gl = 0.0
             sel_gh = 0.0
+            sel2_ll = 0.0
+            sel2_lh = 0.0
+            sel2_gl = 0.0
+            sel2_gh = 0.0
             if have_init and init_ok:
                 if low_ok and (grad_low * g_init < 0.0):
                     sel_ll = lambda_min
@@ -1570,6 +1576,14 @@ if HAS_NUMBA:
                         sel_lh = lambda_max
                         sel_gl = g_init
                         sel_gh = grad_high
+                    else:
+                        # Second null-centered bracket (derivative changes
+                        # sign on both sides of the null h2: multimodal
+                        # profile likelihood). Solved in-kernel below.
+                        sel2_ll = lambda_init
+                        sel2_lh = lambda_max
+                        sel2_gl = g_init
+                        sel2_gh = grad_high
                     count += 1
             if count == 0:
                 for i in range(ne - 1):
@@ -1581,10 +1595,37 @@ if HAS_NUMBA:
                         count = 1
                         break
 
-            if count > 1 or (not bv):
+            if not bv:
                 status[pos] = 1
                 continue
-            if count == 1:
+            if count == 2:
+                # Two brackets (left and right of the null h2). Mirror the
+                # scalar exact solver: root-solve each bracket and keep the
+                # lowest neg-loglik among the roots and the shared grid/init
+                # states. Any failure still routes to the exact fallback.
+                found2, lamr2 = _illinois_lambda_root(
+                    sel2_ll, sel2_lh, sel2_gl, sel2_gh, y, Xa, eig, mdiag, n,
+                    lambda_min, lambda_max)
+                if not found2:
+                    status[pos] = 1
+                    continue
+                if lamr2 < lambda_min:
+                    lamr2 = lambda_min
+                elif lamr2 > lambda_max:
+                    lamr2 = lambda_max
+                h2r2 = lamr2 / (1.0 + lamr2)
+                ok, _, negll, beta_m, ypxy, invb22 = _lrt_eval(
+                    h2r2, y, Xa, eig, mdiag, n, True)
+                if (not ok) or (not np.isfinite(negll)):
+                    status[pos] = 1
+                    continue
+                if negll < best_neg:
+                    best_neg = negll
+                    best_h2 = h2r2
+                    best_beta = beta_m
+                    best_ypxy = ypxy
+                    best_invb22 = invb22
+            if count >= 1:
                 found, lamr = _illinois_lambda_root(
                     sel_ll, sel_lh, sel_gl, sel_gh, y, Xa, eig, mdiag, n,
                     lambda_min, lambda_max)
